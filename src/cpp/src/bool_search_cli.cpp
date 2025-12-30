@@ -2,7 +2,6 @@
 #include "stemmer.h"
 #include "util.h"
 #include <vector>
-
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -159,6 +158,17 @@ static int precedence(TokType t) {
 
 static bool is_unary(TokType t) { return t == TT_NOT; }
 
+static bool is_operator_word(const std::string& s) {
+    if (s.empty()) return false;
+    
+    std::string lower = s;
+    for (char& c : lower) {
+        if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
+    }
+    
+    return lower == "and" || lower == "or" || lower == "not";
+}
+
 static void tokenize_query(const std::string& q,
                            std::vector<Tok>& out,
                            const Tokenizer& tokenizer,
@@ -166,28 +176,52 @@ static void tokenize_query(const std::string& q,
                            bool use_stemming) {
     out.clear();
     std::string cur;
-    cur.reserve(q.size());
-
+    bool last_was_term_or_rp = false; 
+    
     auto flush_word = [&]() {
         if (cur.empty()) return;
 
-        std::vector<std::string> ts;
-        tokenizer.tokenize(cur, ts);
-
-
-        bool first = true;
-        for (auto &raw : ts) {
-            if (raw.empty()) continue;
-
-            std::string term = raw; 
-            if (use_stemming) term = stemmer.stem(term);
-            if (term.empty()) continue;
-
-            if (!first) out.push_back({TT_AND, "AND"});
-            out.push_back({TT_TERM, term});
-            first = false;
+        std::string lower_cur = cur;
+        for (char& c : lower_cur) {
+            if (c >= 'A' && c <= 'Z') c = c - 'A' + 'a';
         }
+        
+        if (lower_cur == "and" || lower_cur == "or" || lower_cur == "not") {
+            if (lower_cur == "and") {
+                out.push_back({TT_AND, "AND"});
+                last_was_term_or_rp = false;
+            }
+            else if (lower_cur == "or") {
+                out.push_back({TT_OR, "OR"});
+                last_was_term_or_rp = false;
+            }
+            else if (lower_cur == "not") {
+                if (last_was_term_or_rp) {
+                    out.push_back({TT_AND, "AND"});
+                }
+                out.push_back({TT_NOT, "NOT"});
+                last_was_term_or_rp = false;
+            }
+        } else {
+            std::vector<std::string> ts;
+            tokenizer.tokenize(cur, ts);
 
+            for (auto &raw : ts) {
+                if (raw.empty()) continue;
+                
+                std::string term = raw; 
+                if (use_stemming) term = stemmer.stem(term);
+                if (term.empty()) continue;
+                
+                if (last_was_term_or_rp) {
+                    out.push_back({TT_AND, "AND"});
+                }
+                
+                out.push_back({TT_TERM, term});
+                last_was_term_or_rp = true;
+            }
+        }
+        
         cur.clear();
     };
 
@@ -196,19 +230,30 @@ static void tokenize_query(const std::string& q,
 
         if (c == '(') {
             flush_word();
+            if (last_was_term_or_rp) {
+                out.push_back({TT_AND, "AND"});
+            }
             out.push_back({TT_LP, "("});
+            last_was_term_or_rp = false;
         } else if (c == ')') {
             flush_word();
             out.push_back({TT_RP, ")"});
+            last_was_term_or_rp = true; 
         } else if (c == '&') {
             flush_word();
             out.push_back({TT_AND, "AND"});
+            last_was_term_or_rp = false;
         } else if (c == '|') {
             flush_word();
             out.push_back({TT_OR, "OR"});
+            last_was_term_or_rp = false;
         } else if (c == '!') {
             flush_word();
+            if (last_was_term_or_rp) {
+                out.push_back({TT_AND, "AND"});
+            }
             out.push_back({TT_NOT, "NOT"});
+            last_was_term_or_rp = false;
         } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             flush_word();
         } else {
@@ -217,51 +262,72 @@ static void tokenize_query(const std::string& q,
     }
     flush_word();
 }
-
 static bool to_postfix(const std::vector<Tok>& in, std::vector<Tok>& out) {
   out.clear();
-  std::vector<Tok> ops;
-
-  for (size_t i = 0; i < in.size(); ++i) {
-    Tok t = in[i];
-    if (t.t == TT_TERM) {
-      out.push_back(t);
-      continue;
+  std::vector<Tok> stack;
+  
+  for (const Tok& tok : in) {
+    switch (tok.t) {
+      case TT_TERM:
+        out.push_back(tok);
+        break;
+        
+      case TT_NOT:
+        stack.push_back(tok);
+        break;
+        
+      case TT_AND:
+      case TT_OR:
+        while (!stack.empty()) {
+          Tok top = stack.back();
+          if (top.t == TT_LP) break;
+          if (precedence(top.t) >= precedence(tok.t)) {
+            out.push_back(top);
+            stack.pop_back();
+          } else {
+            break;
+          }
+        }
+        stack.push_back(tok);
+        break;
+        
+      case TT_LP:
+        stack.push_back(tok);
+        break;
+        
+      case TT_RP:
+        while (!stack.empty() && stack.back().t != TT_LP) {
+          out.push_back(stack.back());
+          stack.pop_back();
+        }
+        if (stack.empty() || stack.back().t != TT_LP) {
+          return false; 
+        }
+        stack.pop_back(); 
+        
+       
+        if (!stack.empty() && stack.back().t == TT_NOT) {
+          out.push_back(stack.back());
+          stack.pop_back();
+        }
+        break;
+        
+      default:
+        return false;
     }
-    if (t.t == TT_LP) { ops.push_back(t); continue; }
-    if (t.t == TT_RP) {
-      bool found = false;
-      while (!ops.empty()) {
-        Tok top = ops.back();
-        ops.pop_back();
-        if (top.t == TT_LP) { found = true; break; }
-        out.push_back(top);
-      }
-      if (!found) return false;
-      continue;
-    }
-
-    while (!ops.empty()) {
-      Tok top = ops.back();
-      if (top.t == TT_LP) break;
-      int p1 = precedence(top.t);
-      int p2 = precedence(t.t);
-      if (p1 > p2 || (p1 == p2 && !is_unary(t.t))) {
-        ops.pop_back();
-        out.push_back(top);
-      } else break;
-    }
-    ops.push_back(t);
   }
-
-  while (!ops.empty()) {
-    Tok top = ops.back();
-    ops.pop_back();
-    if (top.t == TT_LP || top.t == TT_RP) return false;
-    out.push_back(top);
+  
+  while (!stack.empty()) {
+    if (stack.back().t == TT_LP || stack.back().t == TT_RP) {
+      return false; 
+    }
+    out.push_back(stack.back());
+    stack.pop_back();
   }
+  
   return true;
 }
+
 
 static bool eval_postfix(
   const std::vector<Tok>& pf,
@@ -282,13 +348,18 @@ static bool eval_postfix(
       std::vector<uint32_t> v;
       if (idx >= 0) {
         read_postings(postings, lex[(size_t)idx], v);
+      } else {
+        v.clear();
       }
       st.push_back(v);
       continue;
     }
 
     if (t.t == TT_NOT) {
-      if (st.empty()) return false;
+      if (st.empty()) {
+        out.clear();
+        return false;
+      }
       tmp1 = st.back(); st.pop_back();
       complement_all(doc_count, tmp1, tmp2);
       st.push_back(tmp2);
@@ -296,7 +367,10 @@ static bool eval_postfix(
     }
 
     if (t.t == TT_AND || t.t == TT_OR) {
-      if (st.size() < 2) return false;
+      if (st.size() < 2) {
+        out.clear();
+        return false;
+      }
       tmp2 = st.back(); st.pop_back();
       tmp1 = st.back(); st.pop_back();
       if (t.t == TT_AND) {
@@ -310,7 +384,10 @@ static bool eval_postfix(
     return false;
   }
 
-  if (st.size() != 1) return false;
+  if (st.size() != 1) {
+    out.clear();
+    return false;
+  }
   out = st.back();
   return true;
 }
@@ -360,12 +437,31 @@ int main(int argc, char** argv) {
   std::vector<Tok> toks;
   tokenize_query(query, toks, tokenizer, stemmer, use_stemming);
 
+  std::cerr << "Tokens after tokenize_query: ";
+  for (const auto& t : toks) {
+    if (t.t == TT_TERM) std::cerr << "TERM:" << t.term << " ";
+    else if (t.t == TT_AND) std::cerr << "AND ";
+    else if (t.t == TT_OR) std::cerr << "OR ";
+    else if (t.t == TT_NOT) std::cerr << "NOT ";
+    else if (t.t == TT_LP) std::cerr << "( ";
+    else if (t.t == TT_RP) std::cerr << ") ";
+  }
+  std::cerr << "\n";
 
   std::vector<Tok> pf;
   if (!to_postfix(toks, pf)) {
     std::cerr << "Parse error\n";
     return 5;
   }
+
+  std::cerr << "Postfix tokens: ";
+  for (const auto& t : pf) {
+    if (t.t == TT_TERM) std::cerr << "[TERM:" << t.term << "] ";
+    else if (t.t == TT_AND) std::cerr << "[AND] ";
+    else if (t.t == TT_OR) std::cerr << "[OR] ";
+    else if (t.t == TT_NOT) std::cerr << "[NOT] ";
+  }
+  std::cerr << "\n";
 
   std::vector<uint32_t> res;
   if (!eval_postfix(pf, doc_count, lex, postings, res)) {

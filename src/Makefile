@@ -185,7 +185,7 @@ bool_query: require_tokenize build_cpp
 	  exit 2; \
 	fi; \
 	set +H; \
-	"$(BOOL_SEARCH_BIN)" "$$DIR" '$(Q)' --limit "$(LIMIT)" --stemming "$$S"
+	"$(BOOL_SEARCH_BIN)" "$$DIR" "$(subst !,\\!,$(Q))" --limit "$(LIMIT)" --stemming "$$S"
 
 
 full: deps download tokenize zipf index
